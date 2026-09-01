@@ -343,9 +343,31 @@ archive_installed_version() {
 
 installed_version() {
     local package_regex=$1
+    local package_name
+    local package_version
+    local sapjvm_major
 
-    rpm -qa --qf '%{NAME} %{VERSION}\n' \
-        | awk -v package_regex="$package_regex" '$1 ~ package_regex { print $2; exit }'
+    while read -r package_name package_version; do
+        [[ "$package_name" =~ $package_regex ]] || continue
+        if [[ "$package_name" =~ ^sapjvm[_-]?([0-9]+)$ ]]; then
+            sapjvm_major=${BASH_REMATCH[1]}
+            if [[ "$package_version" != "$sapjvm_major."* ]]; then
+                printf '%s.%s\n' "$sapjvm_major" "$package_version"
+                return 0
+            fi
+        fi
+        printf '%s\n' "$package_version"
+        return 0
+    done < <(rpm -qa --qf '%{NAME} %{VERSION}\n')
+}
+
+sapjvm_home_version() {
+    local java_bin="$SAPJVM_HOME/bin/java"
+    local version_output
+
+    [[ -x "$java_bin" ]] || return 0
+    version_output=$("$java_bin" -version 2>&1 || true)
+    sed -nE 's/.*version "([0-9][^"]*)".*/\1/p' <<< "$version_output" | head -n1
 }
 
 append_update_results() {
@@ -377,11 +399,16 @@ ask_or_default_yes() {
 get_installed_version() {
     local product_prefix=$1
     local package_regex=$2
+    local version
 
     if [[ "$INSTALL_MODE" == "archive" ]]; then
         archive_installed_version "$product_prefix"
     else
-        installed_version "$package_regex"
+        version=$(installed_version "$package_regex")
+        if [[ -z "$version" && "$product_prefix" == "sapjvm" ]]; then
+            version=$(sapjvm_home_version)
+        fi
+        printf '%s\n' "$version"
     fi
 }
 
@@ -810,7 +837,7 @@ main() {
     if $DRY_RUN; then
         section "Update check (dry run)"
         if $JVM_AVAILABLE; then
-            dry_run_check "SAP JVM" "sapjvm" '^sapjvm$' "$jvm_version"
+            dry_run_check "SAP JVM" "sapjvm" '^sapjvm([_-]?[0-9]+)?$' "$jvm_version"
         else
             note "SAP JVM: not published for linux-${LINUX_ARCH}; managed outside this helper"
         fi
@@ -827,7 +854,7 @@ main() {
     ask_or_default_yes "Do you accept the SAP JVM EULA (https://${DEV_EULA_COOKIE_VALUE}) and SAP Cloud Connector EULA (https://${SCC_EULA_COOKIE_VALUE})?" || die "You did not accept the EULA. Update aborted."
 
     if $JVM_AVAILABLE; then
-        update_common "SAP JVM" "sapjvm" '^sapjvm$' "$jvm_version" "$jvm_file_type" || overall_status=1
+        update_common "SAP JVM" "sapjvm" '^sapjvm([_-]?[0-9]+)?$' "$jvm_version" "$jvm_file_type" || overall_status=1
     else
         note "SAP JVM is not published for linux-${LINUX_ARCH}; skipping (managed outside this helper)."
         append_update_results "SAP JVM" "SKIPPED - NOT PUBLISHED FOR ${LINUX_ARCH}"
