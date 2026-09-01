@@ -12,6 +12,10 @@ PENDING_UPDATES=0
 JVM_VERSION_OVERRIDE=""
 SCC_VERSION_OVERRIDE=""
 SCC_SERVICE_STOPPED=false
+DEV_EULA_COOKIE_NAME=""
+DEV_EULA_COOKIE_VALUE=""
+SCC_EULA_COOKIE_NAME=""
+SCC_EULA_COOKIE_VALUE=""
 LOG_FILE="${LOG_FILE:-/var/log/cloud-connector-helper.log}"
 UPDATE_RESULTS=""
 WORK_DIR=""
@@ -262,11 +266,27 @@ fetch_tools_page() {
 }
 
 extract_eula_cookie_name() {
-    sed -nE "s/.*eulaConst\.devLicense\.cookieName = '([^']+)'.*/\1/p" <<< "$1" | head -n1
+    local page=$1
+    local license_key=${2:-devLicense}
+
+    sed -nE "s/.*eulaConst\.${license_key}\.cookieName = '([^']+)'.*/\1/p" <<< "$page" | head -n1
 }
 
 extract_eula_cookie_value() {
-    sed -nE "s/.*eulaConst\.devLicense\.cookieValue = '([^']+)'.*/\1/p" <<< "$1" | head -n1
+    local page=$1
+    local license_key=${2:-devLicense}
+
+    sed -nE "s/.*eulaConst\.${license_key}\.cookieValue = '([^']+)'.*/\1/p" <<< "$page" | head -n1
+}
+
+eula_cookie_header() {
+    local product_prefix=$1
+
+    if [[ "$product_prefix" == "sapcc" ]]; then
+        printf '%s=%s' "$SCC_EULA_COOKIE_NAME" "$SCC_EULA_COOKIE_VALUE"
+    else
+        printf '%s=%s' "$DEV_EULA_COOKIE_NAME" "$DEV_EULA_COOKIE_VALUE"
+    fi
 }
 
 list_versions() {
@@ -386,7 +406,11 @@ dry_run_check() {
 download_file() {
     local url=$1
     local output=$2
+    local product_prefix=$3
+    local cookie_header
     local -a progress_opts
+
+    cookie_header=$(eula_cookie_header "$product_prefix")
 
     if [[ -t 1 ]] && ! $QUIET; then
         progress_opts=(--progress-bar)
@@ -395,9 +419,19 @@ download_file() {
     fi
 
     curl -fL "${progress_opts[@]}" --proto '=https' --tlsv1.2 --user-agent "$USER_AGENT" \
-        -b "$EULA_COOKIE_NAME=$EULA_COOKIE_VALUE" \
+        -b "$cookie_header" \
         -o "$output" \
         "$url"
+}
+
+ensure_not_html_download() {
+    local filename=$1
+    local product_name=$2
+
+    if head -c 512 "$filename" | LC_ALL=C grep -qiE '<!doctype html|<html'; then
+        log_error "Downloaded $product_name artifact is an HTML page, not the expected package. SAP may have changed the EULA cookie or download gate."
+        return 1
+    fi
 }
 
 verify_sha1() {
@@ -637,11 +671,12 @@ fetch_and_apply_update() {
     local -a rpm_packages
 
     info "Downloading $product_name $version..."
-    if ! download_file "$download_url" "$artifact"; then
+    if ! download_file "$download_url" "$artifact" "$product_prefix"; then
         log_error "Failed to download $download_url. Check network connectivity and proxy settings (e.g. https_proxy)."
         return 1
     fi
-    if ! download_file "$sha1_url" "${artifact}.sha1"; then
+    ensure_not_html_download "$artifact" "$product_name" || return 1
+    if ! download_file "$sha1_url" "${artifact}.sha1" "$product_prefix"; then
         log_error "Failed to download $sha1_url. Check network connectivity and proxy settings (e.g. https_proxy)."
         return 1
     fi
@@ -749,9 +784,12 @@ main() {
     fi
 
     tools_page=$(fetch_tools_page) || die "Failed to fetch $TOOLS_URL. Check network connectivity and proxy settings (e.g. https_proxy)."
-    EULA_COOKIE_NAME=$(extract_eula_cookie_name "$tools_page")
-    EULA_COOKIE_VALUE=$(extract_eula_cookie_value "$tools_page")
-    [[ -n "$EULA_COOKIE_NAME" && -n "$EULA_COOKIE_VALUE" ]] || die "Failed to extract EULA cookie information."
+    DEV_EULA_COOKIE_NAME=$(extract_eula_cookie_name "$tools_page" devLicense)
+    DEV_EULA_COOKIE_VALUE=$(extract_eula_cookie_value "$tools_page" devLicense)
+    SCC_EULA_COOKIE_NAME=$(extract_eula_cookie_name "$tools_page" cloudConnectorLicense)
+    SCC_EULA_COOKIE_VALUE=$(extract_eula_cookie_value "$tools_page" cloudConnectorLicense)
+    [[ -n "$DEV_EULA_COOKIE_NAME" && -n "$DEV_EULA_COOKIE_VALUE" ]] || die "Failed to extract developer EULA cookie information."
+    [[ -n "$SCC_EULA_COOKIE_NAME" && -n "$SCC_EULA_COOKIE_VALUE" ]] || die "Failed to extract Cloud Connector EULA cookie information."
 
     if [[ "$INSTALL_MODE" == "archive" ]]; then
         jvm_file_type=zip
@@ -786,7 +824,7 @@ main() {
         return 0
     fi
 
-    ask_or_default_yes "Do you accept the EULA (https://${EULA_COOKIE_VALUE})?" || die "You did not accept the EULA. Update aborted."
+    ask_or_default_yes "Do you accept the SAP JVM EULA (https://${DEV_EULA_COOKIE_VALUE}) and SAP Cloud Connector EULA (https://${SCC_EULA_COOKIE_VALUE})?" || die "You did not accept the EULA. Update aborted."
 
     if $JVM_AVAILABLE; then
         update_common "SAP JVM" "sapjvm" '^sapjvm$' "$jvm_version" "$jvm_file_type" || overall_status=1
